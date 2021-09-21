@@ -785,7 +785,11 @@ class OrderLinesCreate(EditableOrderValidationMixin, BaseMutation):
         )
 
         recalculate_order(order)
-        transaction.on_commit(lambda: info.context.plugins.order_updated(order))
+        if order.status == OrderStatus.DRAFT:
+            func = info.context.plugins.draft_order_updated
+        else:
+            func = info.context.plugins.order_updated
+        transaction.on_commit(lambda: func(order))
 
         return OrderLinesCreate(order=order, order_lines=lines)
 
@@ -840,8 +844,11 @@ class OrderLineDelete(EditableOrderValidationMixin, BaseMutation):
         )
 
         recalculate_order(order)
-        transaction.on_commit(lambda: info.context.plugins.order_updated(order))
-
+        if order.status == OrderStatus.DRAFT:
+            func = info.context.plugins.draft_order_updated
+        else:
+            func = info.context.plugins.order_updated
+        transaction.on_commit(lambda: func(order))
         return OrderLineDelete(order=order, order_line=line)
 
 
@@ -908,9 +915,12 @@ class OrderLineUpdate(EditableOrderValidationMixin, ModelMutation):
                 code=OrderErrorCode.INSUFFICIENT_STOCK,
             )
         recalculate_order(instance.order)
-        transaction.on_commit(
-            lambda: info.context.plugins.order_updated(instance.order)
-        )
+
+        if instance.order.status == OrderStatus.DRAFT:
+            func = info.context.plugins.draft_order_updated
+        else:
+            func = info.context.plugins.order_updated
+        transaction.on_commit(lambda: func(instance.order))
 
     @classmethod
     def success_response(cls, instance):
