@@ -113,6 +113,7 @@ def jwt_refresh_token_middleware(get_response):
                 expires=expires,
                 httponly=True,  # protects token from leaking
                 secure=secure,
+                domain="chalk.de"
                 samesite="None" if secure else "Lax",
             )
         return response
