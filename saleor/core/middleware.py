@@ -112,9 +112,9 @@ def jwt_refresh_token_middleware(get_response):
                 jwt_refresh_token,
                 expires=expires,
                 httponly=True,  # protects token from leaking
-                domain="https://rewhite-86006--beta-37alvlew.web.app",
+                domain="rewhite-86006--beta-37alvlew.web.app",
                 secure=secure,
-                samesite="None" if secure else "Lax",
+                samesite="Lax",
             )
         return response
 
