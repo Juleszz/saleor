@@ -32,7 +32,7 @@ from ..warehouse.availability import (
     check_stock_and_preorder_quantity_bulk,
 )
 from ..warehouse.models import Warehouse
-from ..warehouse.reservations import reserve_stocks
+from ..warehouse.reservations import reserve_stocks_and_preorders
 from . import AddressType, calculations
 from .error_codes import CheckoutErrorCode
 from .fetch import (
@@ -66,6 +66,8 @@ def check_variant_in_stock(
     quantity: int = 1,
     replace: bool = False,
     check_quantity: bool = True,
+    checkout_lines: Optional[List["CheckoutLine"]] = None,
+    check_reservations: bool = False,
 ) -> Tuple[int, Optional[CheckoutLine]]:
     """Check if a given variant is in stock and return the new quantity + line."""
     line = checkout.lines.filter(variant=variant).first()
@@ -80,7 +82,12 @@ def check_variant_in_stock(
 
     if new_quantity > 0 and check_quantity:
         check_stock_and_preorder_quantity(
-            variant, checkout.get_country(), channel_slug, new_quantity
+            variant,
+            checkout.get_country(),
+            channel_slug,
+            new_quantity,
+            checkout_lines,
+            check_reservations,
         )
 
     return new_quantity, line
@@ -145,7 +152,6 @@ def add_variants_to_checkout(
     variants,
     quantities,
     channel_slug,
-    skip_stock_check=False,
     replace=False,
     replace_reservations=False,
     reservation_length: Optional[int] = None,
@@ -156,28 +162,7 @@ def add_variants_to_checkout(
     If quantity is set to 0, checkout line will be deleted.
     Otherwise, quantity will be added or replaced (if replace argument is True).
     """
-    # check quantities
     country_code = checkout.get_country()
-    if not skip_stock_check:
-        check_stock_and_preorder_quantity_bulk(
-            variants,
-            country_code,
-            quantities,
-            channel_slug,
-            check_reservations=bool(reservation_length),
-        )
-
-    channel_listings = product_models.ProductChannelListing.objects.filter(
-        channel_id=checkout.channel.id,
-        product_id__in=[v.product_id for v in variants],
-    )
-    channel_listings_by_product_id = {cl.product_id: cl for cl in channel_listings}
-
-    # check if variants are published
-    for variant in variants:
-        product_channel_listing = channel_listings_by_product_id[variant.product_id]
-        if not product_channel_listing or not product_channel_listing.is_published:
-            raise ProductNotPublished()
 
     checkout_lines = checkout.lines.select_related("variant")
     variant_ids_in_lines = {line.variant_id: line for line in checkout_lines}
@@ -214,7 +199,7 @@ def add_variants_to_checkout(
                 to_reserve.append(line)
                 variants.append(line.variant)
 
-        reserve_stocks(
+        reserve_stocks_and_preorders(
             to_reserve,
             variants,
             country_code,
@@ -345,18 +330,26 @@ def _get_products_voucher_discount(
 def get_discounted_lines(
     lines: Iterable["CheckoutLineInfo"], voucher
 ) -> Iterable["CheckoutLineInfo"]:
+    discounted_variants = voucher.variants.all()
     discounted_products = voucher.products.all()
     discounted_categories = set(voucher.categories.all())
     discounted_collections = set(voucher.collections.all())
 
     discounted_lines = []
-    if discounted_products or discounted_collections or discounted_categories:
+    if (
+        discounted_products
+        or discounted_collections
+        or discounted_categories
+        or discounted_variants
+    ):
         for line_info in lines:
+            line_variant = line_info.variant
             line_product = line_info.product
             line_category = line_info.product.category
             line_collections = set(line_info.collections)
             if line_info.variant and (
-                line_product in discounted_products
+                line_variant in discounted_variants
+                or line_product in discounted_products
                 or line_category in discounted_categories
                 or line_collections.intersection(discounted_collections)
             ):
@@ -390,22 +383,13 @@ def get_prices_of_discounted_specific_product(
 
     for line_info in discounted_lines:
         line = line_info.line
-        line_total = calculations.checkout_line_total(
-            manager=manager,
-            checkout_info=checkout_info,
-            lines=lines,
-            checkout_line_info=line_info,
-            discounts=discounts,
-        )
         line_unit_price = manager.calculate_checkout_line_unit_price(
-            line_total,
-            line.quantity,
             checkout_info,
             lines,
             line_info,
             address,
             discounts,
-        ).gross
+        ).price_with_sale.gross
         line_prices.extend([line_unit_price] * line.quantity)
 
     return line_prices
@@ -445,14 +429,20 @@ def get_voucher_discount_for_checkout(
 
 
 def get_voucher_for_checkout(
-    checkout_info: "CheckoutInfo", vouchers=None, with_lock: bool = False
+    checkout: "Checkout",
+    channel_slug: str,
+    with_lock: bool = False,
+    with_prefetch: bool = False,
 ) -> Optional[Voucher]:
-    """Return voucher with voucher code saved in checkout if active or None."""
-    checkout = checkout_info.checkout
+    """Return voucher assigned to checkout."""
     if checkout.voucher_code is not None:
-        if vouchers is None:
-            vouchers = Voucher.objects.active_in_channel(
-                date=timezone.now(), channel_slug=checkout_info.channel.slug
+        vouchers = Voucher.objects
+        vouchers = vouchers.active_in_channel(
+            date=timezone.now(), channel_slug=channel_slug
+        )
+        if with_prefetch:
+            vouchers.prefetch_related(
+                "products", "collections", "categories", "variants", "channel_listings"
             )
         try:
             qs = vouchers
@@ -463,6 +453,19 @@ def get_voucher_for_checkout(
         except Voucher.DoesNotExist:
             return None
     return None
+
+
+def get_voucher_for_checkout_info(
+    checkout_info: "CheckoutInfo", with_lock: bool = False, with_prefetch: bool = False
+) -> Optional[Voucher]:
+    """Return voucher with voucher code saved in checkout if active or None."""
+    checkout = checkout_info.checkout
+    return get_voucher_for_checkout(
+        checkout,
+        channel_slug=checkout_info.channel.slug,
+        with_lock=with_lock,
+        with_prefetch=with_prefetch,
+    )
 
 
 def recalculate_checkout_discount(
@@ -477,7 +480,7 @@ def recalculate_checkout_discount(
     applicable.
     """
     checkout = checkout_info.checkout
-    voucher = get_voucher_for_checkout(checkout_info)
+    voucher = get_voucher_for_checkout_info(checkout_info)
     if voucher is not None:
         address = checkout_info.shipping_address or checkout_info.billing_address
         try:
@@ -615,7 +618,7 @@ def remove_promo_code_from_checkout(checkout_info: "CheckoutInfo", promo_code: s
 
 def remove_voucher_code_from_checkout(checkout_info: "CheckoutInfo", voucher_code: str):
     """Remove voucher data from checkout by code."""
-    existing_voucher = get_voucher_for_checkout(checkout_info)
+    existing_voucher = get_voucher_for_checkout_info(checkout_info)
     if existing_voucher and existing_voucher.code == voucher_code:
         remove_voucher_from_checkout(checkout_info.checkout)
 

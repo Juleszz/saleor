@@ -1,5 +1,6 @@
 import json
 from decimal import Decimal
+from functools import partial
 from unittest import mock
 
 import pytest
@@ -238,12 +239,16 @@ def test_manager_calculates_checkout_line_total(
         checkout_with_item, lines, [discount_info], manager
     )
     checkout_line_info = lines[0]
-    taxed_total = PluginsManager(plugins=plugins).calculate_checkout_line_total(
-        checkout_info,
-        lines,
-        checkout_line_info,
-        checkout_with_item.shipping_address,
-        [discount_info],
+    taxed_total = (
+        PluginsManager(plugins=plugins)
+        .calculate_checkout_line_total(
+            checkout_info,
+            lines,
+            checkout_line_info,
+            checkout_with_item.shipping_address,
+            [discount_info],
+        )
+        .price_with_sale
     )
     assert TaxedMoney(expected_total, expected_total) == taxed_total
 
@@ -446,8 +451,8 @@ def test_manager_get_order_shipping_tax_rate_no_plugins(
         (
             [],
             TaxedMoney(
-                net=Money(amount=15, currency="USD"),
-                gross=Money(amount=15, currency="USD"),
+                net=Money(amount=20, currency="USD"),
+                gross=Money(amount=20, currency="USD"),
             ),
             2,
         ),
@@ -461,14 +466,16 @@ def test_manager_calculates_checkout_line_unit_price(
     checkout_info = fetch_checkout_info(checkout_with_item, lines, [], manager)
     checkout_line_info = lines[0]
 
-    taxed_total = PluginsManager(plugins=plugins).calculate_checkout_line_unit_price(
-        total_line_price,
-        quantity,
-        checkout_info,
-        lines,
-        checkout_line_info,
-        address,
-        [],
+    taxed_total = (
+        PluginsManager(plugins=plugins)
+        .calculate_checkout_line_unit_price(
+            checkout_info,
+            lines,
+            checkout_line_info,
+            address,
+            [],
+        )
+        .price_with_sale
     )
     currency = total_line_price.net.currency
     expected_net = Money(
@@ -1024,3 +1031,40 @@ def test_run_method_on_single_plugin_valid_response(plugins_manager):
         )
         == plugin.SUPPORTED_CURRENCIES
     )
+
+
+def test_run_check_payment_balance(channel_USD):
+    plugins = ["saleor.plugins.tests.sample_plugins.ActiveDummyPaymentGateway"]
+
+    manager = PluginsManager(plugins=plugins)
+    assert manager.check_payment_balance({}, "main") == {"test_response": "success"}
+
+
+def test_run_check_payment_balance_not_implemented(channel_USD):
+    plugins = ["saleor.plugins.tests.sample_plugins.ActivePlugin"]
+
+    manager = PluginsManager(plugins=plugins)
+    assert not manager.check_payment_balance({}, "main")
+
+
+def test_create_plugin_manager_initializes_requestor_lazily(channel_USD):
+    def fake_request_getter(mock):
+        return mock()
+
+    user_mock = mock.MagicMock()
+    user_mock.return_value.id = "some id"
+    user_mock.return_value.name = "some name"
+
+    plugins = ["saleor.plugins.tests.sample_plugins.ActivePlugin"]
+
+    manager = PluginsManager(
+        plugins=plugins, requestor_getter=partial(fake_request_getter, user_mock)
+    )
+    user_mock.assert_not_called()
+
+    plugin = manager.all_plugins.pop()
+
+    assert plugin.requestor.id == "some id"
+    assert plugin.requestor.name == "some name"
+
+    user_mock.assert_called_once()

@@ -3,6 +3,7 @@ from decimal import Decimal
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -22,6 +23,7 @@ from prices import Money, TaxedMoney
 
 from ..channel.models import Channel
 from ..checkout import base_calculations
+from ..checkout.interface import TaxedPricesData
 from ..core.payments import PaymentInterface
 from ..core.prices import quantize_price
 from ..core.taxes import TaxType, zero_taxed_money
@@ -34,6 +36,7 @@ if TYPE_CHECKING:
     from ..account.models import Address, User
     from ..checkout.fetch import CheckoutInfo, CheckoutLineInfo
     from ..checkout.models import Checkout
+    from ..core.middleware import Requestor
     from ..discount.models import Sale
     from ..invoice.models import Invoice
     from ..order.models import Fulfillment, Order, OrderLine
@@ -68,6 +71,7 @@ class PluginsManager(PaymentInterface):
         PluginClass: Type["BasePlugin"],
         config,
         channel: Optional["Channel"] = None,
+        requestor_getter=None,
     ) -> "BasePlugin":
 
         if PluginClass.PLUGIN_ID in config:
@@ -79,9 +83,14 @@ class PluginsManager(PaymentInterface):
             plugin_config = PluginClass.DEFAULT_CONFIGURATION
             active = PluginClass.get_default_active()
 
-        return PluginClass(configuration=plugin_config, active=active, channel=channel)
+        return PluginClass(
+            configuration=plugin_config,
+            active=active,
+            channel=channel,
+            requestor_getter=requestor_getter,
+        )
 
-    def __init__(self, plugins: List[str]):
+    def __init__(self, plugins: List[str], requestor_getter=None):
         with opentracing.global_tracer().start_active_span("PluginsManager.__init__"):
             self.plugins_per_channel = defaultdict(list)
             self.all_plugins = []
@@ -96,14 +105,18 @@ class PluginsManager(PaymentInterface):
                 with opentracing.global_tracer().start_active_span(f"{plugin_path}"):
                     PluginClass = import_string(plugin_path)
                     if not getattr(PluginClass, "CONFIGURATION_PER_CHANNEL", False):
-                        plugin = self._load_plugin(PluginClass, self._global_config)
+                        plugin = self._load_plugin(
+                            PluginClass,
+                            self._global_config,
+                            requestor_getter=requestor_getter,
+                        )
                         self.global_plugins.append(plugin)
                         self.all_plugins.append(plugin)
                     else:
                         for channel in channels:
                             channel_configs = self._configs_per_channel.get(channel, {})
                             plugin = self._load_plugin(
-                                PluginClass, channel_configs, channel
+                                PluginClass, channel_configs, channel, requestor_getter
                             )
                             self.plugins_per_channel[channel.slug].append(plugin)
                             self.all_plugins.append(plugin)
@@ -150,6 +163,11 @@ class PluginsManager(PaymentInterface):
             return previous_value
         return returned_value
 
+    def check_payment_balance(self, details: dict, channel_slug: str) -> dict:
+        return self.__run_method_on_plugins(
+            "check_payment_balance", None, details, channel_slug=channel_slug
+        )
+
     def change_user_address(
         self, address: "Address", address_type: Optional[str], user: Optional["User"]
     ) -> "Address":
@@ -165,7 +183,6 @@ class PluginsManager(PaymentInterface):
         address: Optional["Address"],
         discounts: Iterable[DiscountInfo],
     ) -> TaxedMoney:
-
         default_value = base_calculations.base_checkout_total(
             subtotal=self.calculate_checkout_subtotal(
                 checkout_info, lines, address, discounts
@@ -203,7 +220,7 @@ class PluginsManager(PaymentInterface):
                 line_info,
                 address,
                 discounts,
-            )
+            ).price_with_sale
             for line_info in lines
         ]
         currency = checkout_info.checkout.currency
@@ -291,25 +308,33 @@ class PluginsManager(PaymentInterface):
         checkout_line_info: "CheckoutLineInfo",
         address: Optional["Address"],
         discounts: Iterable["DiscountInfo"],
-    ):
+    ) -> TaxedPricesData:
         default_value = base_calculations.base_checkout_line_total(
             checkout_line_info,
             checkout_info.channel,
             discounts,
         )
-        return quantize_price(
-            self.__run_method_on_plugins(
-                "calculate_checkout_line_total",
-                default_value,
-                checkout_info,
-                lines,
-                checkout_line_info,
-                address,
-                discounts,
-                channel_slug=checkout_info.channel.slug,
-            ),
-            checkout_info.checkout.currency,
+        line_total = self.__run_method_on_plugins(
+            "calculate_checkout_line_total",
+            default_value,
+            checkout_info,
+            lines,
+            checkout_line_info,
+            address,
+            discounts,
+            channel_slug=checkout_info.channel.slug,
         )
+        currency = checkout_info.checkout.currency
+        line_total.price_with_sale = quantize_price(
+            line_total.price_with_sale, currency
+        )
+        line_total.price_with_discounts = quantize_price(
+            line_total.price_with_discounts, currency
+        )
+        line_total.undiscounted_price = quantize_price(
+            line_total.undiscounted_price, currency
+        )
+        return line_total
 
     def calculate_order_line_total(
         self,
@@ -334,30 +359,34 @@ class PluginsManager(PaymentInterface):
 
     def calculate_checkout_line_unit_price(
         self,
-        total_line_price: TaxedMoney,
-        quantity: int,
         checkout_info: "CheckoutInfo",
         lines: Iterable["CheckoutLineInfo"],
         checkout_line_info: "CheckoutLineInfo",
         address: Optional["Address"],
         discounts: Iterable["DiscountInfo"],
-    ):
+    ) -> TaxedPricesData:
         default_value = base_calculations.base_checkout_line_unit_price(
-            total_line_price, quantity
+            checkout_line_info, checkout_info.channel, discounts
         )
-        return quantize_price(
-            self.__run_method_on_plugins(
-                "calculate_checkout_line_unit_price",
-                default_value,
-                checkout_info,
-                lines,
-                checkout_line_info,
-                address,
-                discounts,
-                channel_slug=checkout_info.channel.slug,
-            ),
-            total_line_price.currency,
+        line_unit = self.__run_method_on_plugins(
+            "calculate_checkout_line_unit_price",
+            default_value,
+            checkout_info,
+            lines,
+            checkout_line_info,
+            address,
+            discounts,
+            channel_slug=checkout_info.channel.slug,
         )
+        currency = checkout_info.checkout.currency
+        line_unit.price_with_sale = quantize_price(line_unit.price_with_sale, currency)
+        line_unit.price_with_discounts = quantize_price(
+            line_unit.price_with_discounts, currency
+        )
+        line_unit.undiscounted_price = quantize_price(
+            line_unit.undiscounted_price, currency
+        )
+        return line_unit
 
     def calculate_order_line_unit(
         self,
@@ -1112,6 +1141,8 @@ class PluginsManager(PaymentInterface):
         )
 
 
-def get_plugins_manager() -> PluginsManager:
+def get_plugins_manager(
+    requestor_getter: Optional[Callable[[], "Requestor"]] = None
+) -> PluginsManager:
     with opentracing.global_tracer().start_active_span("get_plugins_manager"):
-        return PluginsManager(settings.PLUGINS)
+        return PluginsManager(settings.PLUGINS, requestor_getter)

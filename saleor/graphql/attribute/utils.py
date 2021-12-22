@@ -1,6 +1,7 @@
 import re
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
@@ -9,6 +10,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db.models import Q
 from django.template.defaultfilters import truncatechars
+from django.utils import timezone
 from django.utils.text import slugify
 from graphql.error import GraphQLError
 
@@ -208,16 +210,18 @@ class AttributeAssignmentMixin:
         attribute: attribute_models.Attribute,
         attr_values: AttrValuesInput,
     ):
-        value = (
-            attr_values.date
-            if attribute.input_type == AttributeInputType.DATE
-            else attr_values.date_time
-        )
+        is_date_attr = attribute.input_type == AttributeInputType.DATE
+        value = attr_values.date if is_date_attr else attr_values.date_time
 
-        defaults = {
-            "date_time": value,
-            "name": value,
-        }
+        tz = timezone.get_current_timezone()
+        date_time = (
+            datetime(
+                value.year, value.month, value.day, 0, 0, tzinfo=tz  # type: ignore
+            )
+            if is_date_attr
+            else value
+        )
+        defaults = {"name": value, "date_time": date_time}
         return (
             cls._update_or_create_value(instance, attribute, defaults) if value else ()
         )
@@ -331,7 +335,7 @@ class AttributeAssignmentMixin:
 
         :raises ValidationError: when an invalid operation was found.
         """
-        variant_validation_pairs = None
+        variant_validation = False
         if is_variant:
             qs = get_variant_selection_attributes(attribute_qs)
             if len(cleaned_input) < qs.count():
@@ -339,15 +343,13 @@ class AttributeAssignmentMixin:
                     "All variant selection attributes must take a value.",
                     code=ProductErrorCode.REQUIRED.value,
                 )
-            variant_validation_pairs = attribute_qs.values(
-                "id", "attributevariant__variant_selection"
-            )
+            variant_validation = True
 
         errors = validate_attributes_input(
             cleaned_input,
             attribute_qs,
             is_page_attributes=is_page_attributes,
-            variant_validation=variant_validation_pairs,
+            variant_validation=variant_validation,
         )
 
         if errors:
@@ -573,7 +575,7 @@ def validate_attributes_input(
     attribute_qs: "QuerySet",
     *,
     is_page_attributes: bool,
-    variant_validation: Optional["QuerySet"] = None,
+    variant_validation: bool,
 ):
     """Validate attribute input.
 
@@ -588,7 +590,6 @@ def validate_attributes_input(
             attribute,
             attr_values,
             attribute_errors,
-            variant_validation,
         )
         if attribute.input_type == AttributeInputType.FILE:
             validate_file_attributes_input(*attrs)
@@ -610,7 +611,7 @@ def validate_attributes_input(
     errors = prepare_error_list_from_error_attribute_mapping(
         attribute_errors, error_code_enum
     )
-    if variant_validation is None:
+    if not variant_validation:
         errors = validate_required_attributes(
             input_data, attribute_qs, errors, error_code_enum
         )
@@ -622,12 +623,11 @@ def validate_file_attributes_input(
     attribute: "Attribute",
     attr_values: "AttrValuesInput",
     attribute_errors: T_ERROR_DICT,
-    variant_validation: Optional["QuerySet"] = None,
 ):
     attribute_id = attr_values.global_id
     value = attr_values.file_url
     if not value:
-        if is_value_required(attribute, variant_validation):
+        if attribute.value_required:
             attribute_errors[AttributeInputErrors.ERROR_NO_FILE_GIVEN].append(
                 attribute_id
             )
@@ -641,12 +641,11 @@ def validate_reference_attributes_input(
     attribute: "Attribute",
     attr_values: "AttrValuesInput",
     attribute_errors: T_ERROR_DICT,
-    variant_validation: Optional["QuerySet"],
 ):
     attribute_id = attr_values.global_id
     references = attr_values.references
     if not references:
-        if is_value_required(attribute, variant_validation):
+        if attribute.value_required:
             attribute_errors[AttributeInputErrors.ERROR_NO_REFERENCE_GIVEN].append(
                 attribute_id
             )
@@ -656,7 +655,6 @@ def validate_boolean_input(
     attribute: "Attribute",
     attr_values: "AttrValuesInput",
     attribute_errors: T_ERROR_DICT,
-    variant_validation: Optional["QuerySet"],
 ):
     attribute_id = attr_values.global_id
     value = attr_values.boolean
@@ -669,7 +667,6 @@ def validate_rich_text_attributes_input(
     attribute: "Attribute",
     attr_values: "AttrValuesInput",
     attribute_errors: T_ERROR_DICT,
-    variant_validation: Optional["QuerySet"],
 ):
     attribute_id = attr_values.global_id
     text = clean_editor_js(attr_values.rich_text or {}, to_string=True)
@@ -682,12 +679,11 @@ def validate_standard_attributes_input(
     attribute: "Attribute",
     attr_values: "AttrValuesInput",
     attribute_errors: T_ERROR_DICT,
-    variant_validation: Optional["QuerySet"],
 ):
     attribute_id = attr_values.global_id
 
     if not attr_values.values:
-        if is_value_required(attribute, variant_validation):
+        if attribute.value_required:
             attribute_errors[AttributeInputErrors.ERROR_NO_VALUE_GIVEN].append(
                 attribute_id
             )
@@ -711,7 +707,6 @@ def validate_date_time_input(
     attribute: "Attribute",
     attr_values: "AttrValuesInput",
     attribute_errors: T_ERROR_DICT,
-    variant_validation: Optional["QuerySet"],
 ):
     is_blank_date = (
         attribute.input_type == AttributeInputType.DATE and not attr_values.date
@@ -749,17 +744,6 @@ def validate_values(
                 attribute_errors[
                     AttributeInputErrors.ERROR_NUMERIC_VALUE_REQUIRED
                 ].append(attribute_id)
-
-
-def is_value_required(
-    attribute: attribute_models.Attribute, variant_validation: Optional["QuerySet"]
-):
-    return attribute.value_required or (
-        variant_validation is not None
-        and variant_validation.get(id=attribute.id)[
-            "attributevariant__variant_selection"
-        ]
-    )
 
 
 def validate_required_attributes(
