@@ -8,7 +8,7 @@ from django.conf import settings
 from ....app.models import App
 from ....payment import PaymentError, TransactionKind
 from ....payment.utils import create_payment_information
-from ....webhook.event_types import WebhookEventType
+from ....webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
 from ....webhook.models import Webhook, WebhookEvent
 from ...manager import get_plugins_manager
 from ..tasks import (
@@ -50,7 +50,7 @@ WebhookTestData = namedtuple("WebhookTestData", "secret, event_type, data, messa
 @pytest.fixture
 def webhook_data():
     secret = "secret"
-    event_type = WebhookEventType.ANY
+    event_type = WebhookEventAsyncType.ANY
     data = json.dumps({"key": "value"})
     message = data.encode("utf-8")
     return WebhookTestData(secret, event_type, data, message)
@@ -59,12 +59,13 @@ def webhook_data():
 @mock.patch("saleor.plugins.webhook.tasks.send_webhook_request_sync")
 def test_trigger_webhook_sync(mock_request, payment_app):
     data = {"key": "value"}
-    trigger_webhook_sync(WebhookEventType.PAYMENT_CAPTURE, data, payment_app)
+    trigger_webhook_sync(WebhookEventSyncType.PAYMENT_CAPTURE, data, payment_app)
     webhook = payment_app.webhooks.first()
     mock_request.assert_called_once_with(
+        payment_app.name,
         webhook.target_url,
         webhook.secret_key,
-        WebhookEventType.PAYMENT_CAPTURE,
+        WebhookEventSyncType.PAYMENT_CAPTURE,
         data,
     )
 
@@ -80,14 +81,15 @@ def test_trigger_webhook_sync_use_first_webhook(mock_request, payment_app):
         name="payment-webhook-2",
         target_url="https://dont-use-this-gateway.com/api/",
     )
-    webhook_2.events.create(event_type=WebhookEventType.PAYMENT_CAPTURE)
+    webhook_2.events.create(event_type=WebhookEventSyncType.PAYMENT_CAPTURE)
 
     data = {"key": "value"}
-    trigger_webhook_sync(WebhookEventType.PAYMENT_CAPTURE, data, payment_app)
+    trigger_webhook_sync(WebhookEventSyncType.PAYMENT_CAPTURE, data, payment_app)
     mock_request.assert_called_once_with(
+        payment_app.name,
         webhook_1.target_url,
         webhook_1.secret_key,
-        WebhookEventType.PAYMENT_CAPTURE,
+        WebhookEventSyncType.PAYMENT_CAPTURE,
         data,
     )
 
@@ -96,7 +98,7 @@ def test_trigger_webhook_sync_no_webhook_available():
     app = App.objects.create(name="Dummy app", is_active=True)
     # should raise an error for app with no payment webhooks
     with pytest.raises(PaymentError):
-        trigger_webhook_sync(WebhookEventType.PAYMENT_REFUND, {}, app)
+        trigger_webhook_sync(WebhookEventSyncType.PAYMENT_REFUND, {}, app)
 
 
 @pytest.mark.parametrize(
@@ -108,7 +110,11 @@ def test_send_webhook_request_sync(
     mock_send_http, target_url, site_settings, webhook_data
 ):
     send_webhook_request_sync(
-        target_url, webhook_data.secret, webhook_data.event_type, webhook_data.data
+        "app_name",
+        target_url,
+        webhook_data.secret,
+        webhook_data.event_type,
+        webhook_data.data,
     )
     mock_send_http.assert_called_once_with(
         target_url,
@@ -129,6 +135,7 @@ def test_send_webhook_request_with_proper_timeout(
     mock_post, target_url, site_settings, webhook_data
 ):
     send_webhook_request(
+        "app_name",
         "ID",
         target_url,
         webhook_data.secret,
@@ -142,7 +149,7 @@ def test_send_webhook_request_with_proper_timeout(
 def test_send_webhook_request_sync_invalid_scheme():
     with pytest.raises(ValueError):
         target_url = "gcpubsub://cloud.google.com/projects/saleor/topics/test"
-        send_webhook_request_sync(target_url, "", "", "")
+        send_webhook_request_sync("", target_url, "", "", "")
 
 
 @mock.patch("saleor.plugins.webhook.tasks.send_webhook_request_sync")
@@ -161,7 +168,7 @@ def test_get_payment_gateways(
     webhook.events.bulk_create(
         [
             WebhookEvent(event_type=event_type, webhook=webhook)
-            for event_type in WebhookEventType.PAYMENT_EVENTS
+            for event_type in WebhookEventSyncType.PAYMENT_EVENTS
         ]
     )
 
@@ -264,7 +271,7 @@ def test_run_payment_webhook_invalid_app(payment_invalid_app, webhook_plugin):
     payment_information = create_payment_information(payment_invalid_app, "token")
     with pytest.raises(PaymentError):
         plugin._WebhookPlugin__run_payment_webhook(
-            WebhookEventType.PAYMENT_AUTHORIZE,
+            WebhookEventSyncType.PAYMENT_AUTHORIZE,
             TransactionKind.AUTH,
             payment_information,
             None,
@@ -277,7 +284,7 @@ def test_run_payment_webhook_no_payment_app_data(payment, webhook_plugin):
     payment_information.gateway = "dummy"
     with pytest.raises(PaymentError):
         plugin._WebhookPlugin__run_payment_webhook(
-            WebhookEventType.PAYMENT_AUTHORIZE,
+            WebhookEventSyncType.PAYMENT_AUTHORIZE,
             TransactionKind.AUTH,
             payment_information,
             None,
@@ -290,7 +297,7 @@ def test_run_payment_webhook_inactive_plugin(payment, webhook_plugin):
     payment_information = create_payment_information(payment, "token")
     dummy_previous_value = {"key": "dummy"}
     response = plugin._WebhookPlugin__run_payment_webhook(
-        WebhookEventType.PAYMENT_AUTHORIZE,
+        WebhookEventSyncType.PAYMENT_AUTHORIZE,
         TransactionKind.AUTH,
         payment_information,
         dummy_previous_value,
@@ -306,7 +313,7 @@ def test_run_payment_webhook_no_response(mock_send_request, payment, webhook_plu
     payment_information = create_payment_information(payment, "token")
     with pytest.raises(PaymentError):
         plugin._WebhookPlugin__run_payment_webhook(
-            WebhookEventType.PAYMENT_AUTHORIZE,
+            WebhookEventSyncType.PAYMENT_AUTHORIZE,
             TransactionKind.AUTH,
             payment_information,
             {},
@@ -320,7 +327,7 @@ def test_run_payment_webhook_empty_response(mock_send_request, payment, webhook_
     plugin = webhook_plugin()
     payment_information = create_payment_information(payment, "token")
     response = plugin._WebhookPlugin__run_payment_webhook(
-        WebhookEventType.PAYMENT_AUTHORIZE,
+        WebhookEventSyncType.PAYMENT_AUTHORIZE,
         TransactionKind.AUTH,
         payment_information,
         {},

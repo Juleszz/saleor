@@ -13,10 +13,11 @@ from google.cloud import pubsub_v1
 from requests.exceptions import RequestException
 
 from ...celeryconf import app
+from ...core.tracing import webhooks_opentracing_trace
 from ...payment import PaymentError
 from ...settings import WEBHOOK_SYNC_TIMEOUT, WEBHOOK_TIMEOUT
 from ...site.models import Site
-from ...webhook.event_types import WebhookEventType
+from ...webhook.event_types import WebhookEventAsyncType, WebhookEventSyncType
 from ...webhook.models import Webhook
 from . import signature_for_payload
 
@@ -38,7 +39,9 @@ class WebhookSchemes(str, Enum):
 def _get_webhooks_for_event(event_type, webhooks=None):
     """Get active webhooks from the database for an event."""
     permissions = {}
-    required_permission = WebhookEventType.PERMISSIONS.get(event_type)
+    required_permission = WebhookEventAsyncType.PERMISSIONS.get(
+        event_type, WebhookEventSyncType.PERMISSIONS.get(event_type)
+    )
     if required_permission:
         app_label, codename = required_permission.value.split(".")
         permissions["app__permissions__content_type__app_label"] = app_label
@@ -50,7 +53,7 @@ def _get_webhooks_for_event(event_type, webhooks=None):
     webhooks = webhooks.filter(
         is_active=True,
         app__is_active=True,
-        events__event_type__in=[event_type, WebhookEventType.ANY],
+        events__event_type__in=[event_type, WebhookEventAsyncType.ANY],
         **permissions,
     )
     webhooks = webhooks.select_related("app").prefetch_related(
@@ -65,7 +68,12 @@ def trigger_webhooks_for_event(event_type, data):
     webhooks = _get_webhooks_for_event(event_type)
     for webhook in webhooks:
         send_webhook_request.delay(
-            webhook.pk, webhook.target_url, webhook.secret_key, event_type, data
+            webhook.app.name,
+            webhook.pk,
+            webhook.target_url,
+            webhook.secret_key,
+            event_type,
+            data,
         )
 
 
@@ -77,13 +85,25 @@ def trigger_webhook_sync(event_type: str, data: str, app: "App"):
         raise PaymentError(f"No payment webhook found for event: {event_type}.")
 
     return send_webhook_request_sync(
-        webhook.target_url, webhook.secret_key, event_type, data
+        app.name, webhook.target_url, webhook.secret_key, event_type, data
     )
 
 
 def send_webhook_using_http(
     target_url, message, domain, signature, event_type, timeout=WEBHOOK_TIMEOUT
 ):
+    """Send a webhook requst using http / https protocol.
+
+    :param target_url: Target URL request will be sent to.
+    :param message: Payload that will be used.
+    :param domain: Current site domain.
+    :param signature: Webhook secret key checksum.
+    :param event_type: Webhook event type.
+    :param timeout: Request timeout.
+
+    :raises HTTPError: Requests exception class containg error message.
+    :return: HTTP response object.
+    """
     headers = {
         "Content-Type": "application/json",
         # X- headers will be deprecated in Saleor 4.0, proper headers are without X-
@@ -155,7 +175,9 @@ def send_webhook_using_google_cloud_pubsub(
     retry_kwargs={"max_retries": 5},
     compression="zlib",
 )
-def send_webhook_request(self, webhook_id, target_url, secret, event_type, data):
+def send_webhook_request(
+    self, app_name, webhook_id, target_url, secret, event_type, data
+):
     parts = urlparse(target_url)
     domain = Site.objects.get_current().domain
     message = data.encode("utf-8")
@@ -174,7 +196,8 @@ def send_webhook_request(self, webhook_id, target_url, secret, event_type, data)
     if methods := scheme_matrix.get(parts.scheme.lower()):
         send_method, send_exception = methods
         try:
-            send_method(target_url, message, domain, signature, event_type)
+            with webhooks_opentracing_trace(event_type, domain, app_name=app_name):
+                send_method(target_url, message, domain, signature, event_type)
         except send_exception as e:
             task_logger.info("[Webhook] Failed request to %r: %r.", target_url, e)
             try:
@@ -195,7 +218,7 @@ def send_webhook_request(self, webhook_id, target_url, secret, event_type, data)
         raise ValueError("Unknown webhook scheme: %r" % (parts.scheme,))
 
 
-def send_webhook_request_sync(target_url, secret, event_type, data: str):
+def send_webhook_request_sync(app_name, target_url, secret, event_type, data: str):
     parts = urlparse(target_url)
     domain = Site.objects.get_current().domain
     message = data.encode("utf-8")
@@ -207,19 +230,22 @@ def send_webhook_request_sync(target_url, secret, event_type, data: str):
             "[Webhook] Sending payload to %r for event %r.", target_url, event_type
         )
         try:
-            response = send_webhook_using_http(
-                target_url,
-                message,
-                domain,
-                signature,
-                event_type,
-                timeout=WEBHOOK_SYNC_TIMEOUT,
-            )
-            response_data = response.json()
+            with webhooks_opentracing_trace(
+                event_type, domain, sync=True, app_name=app_name
+            ):
+                response = send_webhook_using_http(
+                    target_url,
+                    message,
+                    domain,
+                    signature,
+                    event_type,
+                    timeout=WEBHOOK_SYNC_TIMEOUT,
+                )
+                response_data = response.json()
         except RequestException as e:
-            logger.debug("[Webhook] Failed request to %r: %r.", target_url, e)
+            logger.warning("[Webhook] Failed request to %r: %r.", target_url, e)
         except JSONDecodeError as e:
-            logger.debug(
+            logger.warning(
                 "[Webhook] Failed parsing JSON response from %r: %r.", target_url, e
             )
         else:
