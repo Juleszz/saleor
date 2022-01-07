@@ -127,8 +127,7 @@ def jwt_refresh_token_middleware(get_response):
                 expires=expires,
                 httponly=True,  # protects token from leaking
                 secure=secure,
-                domain=".rewhite-climbing.de",
-                samesite="Strict" if secure else "Lax",
+                samesite="None" if secure else "Lax",
             )
         return response
 
